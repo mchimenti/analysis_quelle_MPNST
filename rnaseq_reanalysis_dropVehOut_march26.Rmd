@@ -1,0 +1,340 @@
+---
+title: 'De novo MPNST Drug Study: RNAseq in mouse DROP Veh outlier March 26'
+author: "Michael S. Chimenti"
+date: "03.26.20"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+require("knitr")
+knitr::opts_chunk$set(echo = TRUE)
+opts_knit$set(root.dir = "~/collab_proj/quelle/project_rnaseq_mouse_MPNST_feb2021/")
+
+```
+
+### Samples were prepared according to: 
+
+The library prep used the TruSeq mRNA stranded kit and then they ran paired ends at 2x150 bp.
+
+### Upstream processing 
+
+Samples were processed with `bcbio v 1.2.4` using the `mm10` genome build from Ensembl. `hisat2` and `salmon` were used for alignment. 
+
+### Example methods 
+
+Here is a methods paragraph that captures what we did: 
+
+**Analysis was conducted by the Bioinformatics Division of the Iowa Institute of Human Genetics (IIHG).  Reads were processed with the ‘bcbio-nextgen.py’ open-source informatics pipeline developed primarily at Harvard Chan Bioinformatics (v.1.0.8) [32] running on the Argon HPC resource at the University of Iowa.  This pipeline includes ‘best practices’ approaches for read quality control, read alignment and quantitation.  The ‘bcbio-nextgen.py’ pipeline was run in “RNA-seq” mode with the ‘mm10’ key as the selected genome build (internally referencing Ensembl GRCm38.p6 v94, GENCODE M19).  The pipeline aligned reads to the GRCm38 genome using the splice-aware, ultra-rapid hisat2 aligner (2.1.0) [34,35] and concurrently quantified reads to the GENCODE M19 transcriptome using the ‘salmon’ (0.9.1) aligner [36].  Qualimap (2.2.2) [33], a computational tool that examines hisat2 BAM alignment files, was used to examine the read data for quality control. We observed > X% of RNA-seq reads uniquely mapping to the reference and >X% of reads in exonic regions.  Sequence quality scores passed basic checks, and sequence duplication rates were within acceptable parameters.  Salmon-derived transcript quantifications (TPM) were imported and summarized to estimated counts at the gene level using tximport (1.12.3) in Rstudio [37], as described in the best-practices DESeq2 vignette (https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html).  Genes with fewer than 5 estimated counts across all samples were pre-filtered from downstream analysis, as per recommended procedure.  Differential gene expression analysis was conducted with DESeq2(1.24.0) on estimated gene-level counts [38].  An FDR of 5% and X < abs(logFC) < 10 was set as a cutoff for differential expression (DEGs).**
+
+
+
+<details>
+  <summary>Code: Package Imports </summary>
+  <p>
+  
+```{r, imports, warnings=FALSE, message=FALSE, eval=TRUE}
+#negative binomial GLM and related
+library('DESeq2')
+library('calibrate')
+library('tximport')
+library('readr')
+library('rhdf5')
+#Exploratory analysis
+library('tidyverse')
+library('pcaExplorer')
+library('ggrepel')
+library('kableExtra')
+#pathway and gene clusters
+library('DEGreport')
+
+
+
+```
+
+ </p>
+</details>
+
+
+```{r, function_defs, eval=TRUE, echo = FALSE}
+
+## Volcano Plot
+do_vol_plot <- function(df, sig=0.05, fc=0.5, size = 4){
+  
+  df_sig<- df %>% filter(padj < sig)
+  
+  ## genes with labels -- signficant,decreased expression and start with IGF
+  
+  df_label<- df %>% 
+              filter(padj < sig, abs(log2FoldChange) > fc)
+              #mutate(short_id = stringr::str_split(gene_id, "000000") %>% map_chr(.,2))
+  
+  
+  ## plot
+  
+  p <- ggplot(df, aes(log2FoldChange, -log10(padj)))  +
+      geom_point(size=0.8, color="black", alpha=.8) + 
+      geom_point(size=0.8, data=df_sig, aes(log2FoldChange, -log10(padj)), colour="red") +
+       geom_text_repel(size= size, 
+                    colour="black",
+                    segment.size=0.1, 
+                    nudge_x=0.06, 
+                    nudge_y=0.06, 
+                    data=df_label,
+                    aes(log2FoldChange, -log10(padj), label=gene_name), 
+                    max.iter= 200, 
+                    point.padding = 0.15, 
+                    segment.alpha = 1, 
+                    box.padding=.15,
+                    min.segment.length = unit(0.15, 'lines'),size=2.5) +
+    theme(
+      axis.text.x = element_text(size=12),
+      axis.text.y = element_text(size=12),
+      axis.title.x = element_text(size=14, margin = margin(t = 10, r = 0, b = 10, l = 0)),
+      axis.title.y = element_text(size=14, margin = margin(t = 0, r = 10, b = 0, l = 10)),
+      plot.margin =unit(c(.5,.5,.5,.5),"cm"),
+      plot.title = element_text(size = 11)
+    )
+  
+  return (p)
+}
+
+#function to quickly get sorted results 
+get_res <- function(dds, meta_col, cond1, cond2, anno, pval = 0.05){
+  res <- results(dds, contrast = c(meta_col,cond1,cond2))
+  res <- na.omit(res)
+  res_sig <- res[res$padj < pval,]
+  res_ord <- res_sig[order(res_sig$padj),]
+  return(res_ord)
+}
+
+
+get_res_iPG <- function(dds, meta_col, cond1, cond2, anno, pval = 0.05){
+  res <- results(dds, contrast = c(meta_col,cond1,cond2))
+  res <- na.omit(res)
+  res <- res[abs(res$log2FoldChange) < 10, ]
+  res$gene_id <- row.names(res)
+  res <- left_join(as_tibble(res), as_tibble(anno), by = "gene_id")
+  write.table(res, file = paste0("res_for_iPath_", cond1, "_", cond2, ".txt"), sep = '\t', 
+              row.names=FALSE)}
+```
+
+
+ </p>
+</details>
+
+### Importing the data and converting to counts for DESeq2
+
+The metadata table looks like this: 
+```{r, import_meta}
+samples <- read.table("samples.csv", sep=',', header=TRUE)
+head(samples, 10)
+```
+
+```{r, sample_import, echo=FALSE}
+rownames(samples) <- samples$sample
+samples$sample <- as.character(samples$sample)
+
+files <- file.path(getwd(), samples$sample, 'salmon', 'quant.sf')
+names(files) <- samples$sample
+```
+
+Now, we import 'salmon' quantification tables, using the `tx2gene` object to correlate transcripts to genes: 
+```{r, tximport, cache=TRUE}
+tx2gene <- read.csv(file.path(getwd(), "tx2gene.csv"), header = FALSE, as.is = c(1:2)) 
+txi <- tximport(files, type="salmon", tx2gene=tx2gene)
+```
+
+### DESeq2 analysis 
+
+First, we'll create a DESeq2 object and drop the outlier "VehUR8FFT"
+```{r, make_DEseq, warning = FALSE}
+ddsTxi <- DESeqDataSetFromTximport(txi,
+                                   colData = samples,
+                                   design = ~ sex + cond)
+
+ddsTxi <- ddsTxi[ rowSums(counts(ddsTxi)) > 5, ]
+ddsTxi <- DESeq(ddsTxi)
+ddsTxi_drop <- ddsTxi[,!ddsTxi$sample == "VehUR8FFT"]
+ddsTxi_drop <- DESeq(ddsTxi_drop)
+```
+
+### Variance stabilizing transformation and PCA visualization
+
+Next, we'll get the Ensembl annotation and perform a variance-stabilizing transformation for visualization: 
+```{r, anno_and_vst}
+anno <- readRDS("~/Desktop/anno_mm10.rds")
+anno <- na.omit(anno)
+vstTxi_drop <- vst(ddsTxi_drop, blind=FALSE)
+colnames(vstTxi_drop) <- vstTxi_drop$sample
+```
+
+Finally, we'll look at the PCA plot:
+
+
+```{r, PCA_explorer_1, echo=FALSE, dpi = 200}
+p <- pcaExplorer::pcaplot(vstTxi_drop, intgroup = c("cond"), ellipse = FALSE, text_labels = TRUE, point_size = 2, ntop=500, pcX = 1, pcY = 2)
+p <- p + ggtitle("Vehicle clusters together with outlier dropped")
+show(p)
+```
+
+## DEG calculation
+
+**NOTE:I redid this section filtering OUT any DEG with abs(log2FC) > 10.  These extremely large logFC DEGs are likely artifacts.  They should be ignored.**
+
+
+```{r, get_res, echo = FALSE}
+
+## here we define getting an annotated results tibble 
+get_res_tib_anno <- function(dds, meta_col, cond1, cond2, anno, pval = 0.05){
+  res <- results(dds, contrast = c(meta_col,cond1,cond2))
+  res <- na.omit(res)
+  res_sig <- res[res$padj < pval & abs(res$log2FoldChange) < 10,]
+  res_ord <- res_sig[order(res_sig$padj),]
+  res_ord$gene_id <- row.names(res_ord)
+  res_ord <- left_join(as_tibble(res_ord), anno, by = "gene_id")
+  return(res_ord)
+}
+```
+
+### Combo resistant vs vehicle, Volcano Plot 
+
+```{r, res1, dpi = 200, warning = FALSE, message = FALSE}
+res_combo_res <- get_res_tib_anno(ddsTxi_drop, "cond", "combo_res", "veh", pval = 0.1, anno = anno)
+p1 <- do_vol_plot(res_combo_res, sig = 0.01, fc = 1.0, size = 4)
+p1 <- p1 + ggtitle("423 DEGs Res vs Veh (red = DEGS at FDR of 0.01)")
+p1
+```
+
+### There are 423 DEGs between combo_resistant and "vehicle" at a FDR = 0.1
+
+### Top 12 DE genes Combo Resistant vs Vehicle Count Plots 
+```{r, gene_plot1, dpi = 200, fig.width=9, warning = FALSE, message = FALSE}
+res <- results(ddsTxi_drop, contrast = c("cond","combo_res","veh"))
+res <- na.omit(res)
+res <- res[abs(res$log2FoldChange) < 10,]
+DEGreport::degPlot(ddsTxi_drop, xs = "cond", res = res, n = 12, group = "sex", 
+                   xsLab = "Treatment", ysLab = "raw counts")
+
+```
+
+### Top 20 DEGs table between combo_resistant and vehicle
+
+```{r, table1}
+my_cols <- c("log2FoldChange","pvalue","padj","gene_id","gene_name","description")
+head(res_combo_res[,my_cols], 10) %>% kable() %>% kable_styling()
+
+```
+
+
+### Combo sensitive vs vehicle; Volcano Plot 
+
+```{r, res2, dpi = 200, warning = FALSE, message=FALSE}
+res_combo_sen <- get_res_tib_anno(ddsTxi_drop, "cond", "combo_sen", "veh", pval = 0.1, anno = anno)
+
+p1 <- do_vol_plot(res_combo_sen, sig = 0.0005, fc = 1.0, size = 4)
+p1 <- p1 + ggtitle("There are 1461 DEGs Sens vs Veh (Red = DEGs at FDR = 0.0005)")
+p1
+```
+
+
+### Top 12  DE genes Combo Sensitive vs Vehicle Count Plots 
+```{r, gene_plot2, dpi = 200, fig.width = 9, warning = FALSE, message = FALSE}
+res <- results(ddsTxi_drop, contrast = c("cond","combo_sen","veh"))
+res <- na.omit(res)
+res <- res[abs(res$log2FoldChange) < 10,]
+DEGreport::degPlot(ddsTxi_drop, xs = "cond", res = res, n = 12, group = "sex", 
+                   xsLab = "Treatment", ysLab = "raw counts")
+```
+
+### Top 20 DEGs table between combo_sensitive and vehicle
+
+```{r, table2}
+head(res_combo_sen[,my_cols], 20) %>% kable() %>% kable_styling()
+
+```
+
+
+### Combo Sensitive vs Combo Resistant 
+
+#### Positive log FC is UP in combo sensitive 
+
+```{r, res3, dpi = 200, warning = FALSE, message = FALSE}
+res_sens_vs_resist <- get_res_tib_anno(ddsTxi_drop, "cond", "combo_sen", "combo_res", pval = 0.1, anno = anno)
+p1 <- do_vol_plot(res_sens_vs_resist, sig = 0.01, fc = 1.0, size = 4)
+p1 <- p1 + ggtitle("244 DEGs between combo_sens and combo_resist (red = FDR 0.01)")
+p1
+```
+
+
+
+### Top 12 DEGS plot Combo Sens vs Combo Res 
+```{r, gene_plot3, dpi = 200, fig.width = 9, warning = FALSE, message = FALSE}
+res <- results(ddsTxi_drop, contrast = c("cond","combo_sen","combo_res"))
+res <- na.omit(res)
+res <- res[abs(res$log2FoldChange) < 10,]
+DEGreport::degPlot(ddsTxi_drop, xs = "cond", res = res, n = 12, group = "sex", 
+                   xsLab = "Treatment", ysLab = "raw counts")
+```
+
+
+### Top 20 DEGS Table Combo Sens vs Combo Resistant
+
+**We can see that Immunoglobin Light Chains dominate the DEGs between the two tumor types**
+
+```{r, table3}
+head(res_sens_vs_resist[,my_cols], 20) %>% kable() %>% kable_styling()
+```
+
+
+### VENN analysis 
+
+How do the these gene lists compare to each other?  
+
+```{r, venn, warning=FALSE, message=FALSE }
+library(Vennerable)
+v <- Vennerable::Venn(list(combo_res_DEGs = res_combo_res$gene_id, combo_sen_DEGs = res_combo_sen$gene_id, sens_vs_res_DEGs = res_sens_vs_resist$gene_id))
+plot(v, doWeights = TRUE)
+
+```
+
+```{r, write_gene_lists, echo=FALSE}
+
+readr::write_csv(res_combo_res[,my_cols], "DEGs_combo_resistant_vs_vehicle_FDR_10percent_VEHUR8_OUT_DROP.csv")
+readr::write_csv(res_combo_sen[,my_cols], "DEGs_combo_sensitive_vs_vehicle_FDR_10percent_VEHUR8_OUT_DROP.csv")
+readr::write_csv(res_sens_vs_resist[,my_cols], "DEGS_combo_sensitive_vs_combo_resistant_FDR_10percent_VEHUR8_OUT_DROP.csv")
+
+get_res_iPG(dds = ddsTxi_drop, meta_col = "cond", cond1 = "combo_sen", cond2 = "veh", anno = anno)
+get_res_iPG(dds = ddsTxi_drop, meta_col = "cond", cond1 = "combo_res", cond2 = "veh", anno = anno)
+get_res_iPG(dds = ddsTxi_drop, meta_col = "cond", cond1 = "combo_sen", cond2 = "combo_res", anno = anno)
+
+```
+
+
+If we wanted to try to model this weird batch in myosin levels, we might try something like this:
+```{r, new_covariate, eval = FALSE}
+tab <- counts(ddsTxi) %>% as_tibble(rownames = "gene_id") %>% filter(gene_id %in% c("ENSMUSG00000055775", "ENSMUSG00000061086", "ENSMUSG00000009214", "ENSMUSG00000091898", "ENSMUSG00000091898", "ENSMUSG00000026414"))
+
+tab2 <- tab %>% reshape2::melt() %>% group_by(variable) %>% mutate(ave_exp = mean(value))
+tab3 <- tab2 %>% select(c(variable,ave_exp)) %>% unique()
+tab3$myo_batch <- cut(tab3$ave_exp, breaks = c(0,500,10000), label = c("low_myo_exprs","high_myo_exprs"))
+
+
+colnames(tab3) <- c("sample","ave_exp","myo")
+colData(ddsTxi)$myo <- tab3$myo
+#samples2 <- left_join(samples, tab3, by = "sample")
+
+#design(ddsTxi_drop) <- ~ sex + cond + myo
+#ddsTxi_drop_batch <- DESeq(ddsTxi_drop)
+vstTxi <- vst(ddsTxi)
+p <- pcaExplorer::pcaplot(vstTxi, intgroup = c("myo"), ellipse = FALSE, text_labels = TRUE, point_size = 2, ntop=500, pcX = 1, pcY = 2)
+p <- p + ggtitle("Myosin, troponin, actin, GPCR, SRY, interleukin33 levels")
+show(p)
+
+```
+
+
+```{r, sessionInfo}
+sessionInfo()
+```
